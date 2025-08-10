@@ -1,5 +1,5 @@
-// api/build.ts — v9.4: toolbox search with roproxy fallbacks, never 500
-export const config = { runtime: "nodejs18.x" };
+// api/build.ts — v9.4 (roproxy + Node runtime fix)
+export const config = { runtime: "nodejs" };
 
 const MAX_RESULTS = 6;
 const GAP = 10;
@@ -17,9 +17,7 @@ function extractAssetIds(p: string): number[] {
 }
 
 async function tryFetchJson(url: string) {
-  const r = await fetch(url, {
-    headers: { Accept: "application/json", "User-Agent": "ai-build-endpoint/1.0" },
-  });
+  const r = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "ai-build-endpoint/1.0" } });
   const text = await r.text();
   let json: any = null;
   try { json = text ? JSON.parse(text) : null; } catch {}
@@ -29,11 +27,9 @@ async function tryFetchJson(url: string) {
 async function searchToolbox(keyword: string): Promise<{ ids: number[]; debug: string }> {
   const k = encodeURIComponent(keyword.trim());
   const tries = [
-    // modern
     `https://catalog.roblox.com/v1/search/items/details?Category=Models&Limit=${MAX_RESULTS}&Keyword=${k}`,
     `https://catalog.roproxy.com/v1/search/items/details?Category=Models&Limit=${MAX_RESULTS}&Keyword=${k}`,
     `https://catalog.rprxy.xyz/v1/search/items/details?Category=Models&Limit=${MAX_RESULTS}&Keyword=${k}`,
-    // legacy
     `https://search.roblox.com/catalog/json?Category=Models&Keyword=${k}`,
     `https://search.roproxy.com/catalog/json?Category=Models&Keyword=${k}`,
     `https://search.rprxy.xyz/catalog/json?Category=Models&Keyword=${k}`,
@@ -53,22 +49,19 @@ async function searchToolbox(keyword: string): Promise<{ ids: number[]; debug: s
       } else if (Array.isArray(json)) {
         for (const it of json) if (it && (it.AssetId || it.Id || it.id)) ids.push(Number(it.AssetId || it.Id || it.id));
       }
-      if (ids.length) break; // ilk başarılı sonuçta çık
+      if (ids.length) break;
     } catch (e: any) {
       dbg.push(`${new URL(url).host}_err=${String(e)}`);
     }
   }
 
-  // benzersiz ve sınırlı
-  const uniq = Array.from(new Set(ids)).slice(0, MAX_RESULTS);
-  return { ids: uniq, debug: dbg.join(" | ") };
+  return { ids: Array.from(new Set(ids)).slice(0, MAX_RESULTS), debug: dbg.join(" | ") };
 }
 
 export default async (req: Request) => {
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ ok: true, msg: "POST { obs:{ prompt:'stone' } }" }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
+      status: 200, headers: { "Content-Type": "application/json" },
     });
   }
   try {
@@ -76,11 +69,9 @@ export default async (req: Request) => {
     const prompt = String(obs?.prompt || "").slice(0, 200).trim();
     const actions: any[] = [];
 
-    // 1) Prompt içindeki link/ID'leri kullan
     let ids = extractAssetIds(prompt);
     let debug = `ids_in_prompt=${ids.join(",")}`;
 
-    // 2) Yoksa prompt'u direkt ara (her zaman dene)
     if (ids.length === 0 && prompt.length >= 2) {
       const r = await searchToolbox(prompt);
       ids = r.ids;
@@ -88,30 +79,24 @@ export default async (req: Request) => {
     }
 
     if (ids.length > 0) {
-      // 3x2 grid yerleşim (origin'i server offsetleyecek)
       for (let i = 0; i < Math.min(MAX_RESULTS, ids.length); i++) {
         const col = i % 3, row = Math.floor(i / 3);
-        const x = (col - 1) * GAP, z = row * GAP;
-        actions.push({ type: "PLACE_ASSET", assetId: ids[i], pos: [x, BASE_Y, z], yaw: 0 });
+        actions.push({ type: "PLACE_ASSET", assetId: ids[i], pos: [(col - 1) * GAP, BASE_Y, row * GAP], yaw: 0 });
       }
       return new Response(JSON.stringify({ actions, reason: "toolbox", detail: debug }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
+        status: 200, headers: { "Content-Type": "application/json" },
       });
     }
 
-    // 3) FALLBACK (boş dönme)
     actions.push({ type: "PLACE_BLOCK", block: "Concrete", pos: [0, 1, 0], size: [16, 1, 16], color: "#D0D0D0" });
     actions.push({ type: "PLACE_MODEL", key: "Bench", pos: [-3, 1, 0], yaw: 0 });
     actions.push({ type: "PLACE_MODEL", key: "Bench", pos: [3, 1, 0], yaw: 180 });
     return new Response(JSON.stringify({ actions, reason: "fallback", detail: debug }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
+      status: 200, headers: { "Content-Type": "application/json" },
     });
   } catch (e: any) {
     return new Response(JSON.stringify({ actions: [], reason: "exception", detail: String(e?.stack || e) }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
+      status: 200, headers: { "Content-Type": "application/json" },
     });
   }
 };
