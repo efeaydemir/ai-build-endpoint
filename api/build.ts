@@ -1,4 +1,4 @@
-// api/build.ts — v10: Open Cloud Toolbox (x-api-key), proxy fallback, PLACE_ASSET only
+// api/build.ts — v10.1: Open Cloud Toolbox (x-api-key), proxy fallback, PLACE_ASSET only + GET env check
 export const config = { runtime: "edge" };
 
 const MAX_RESULTS = 6;
@@ -43,9 +43,13 @@ async function searchOpenCloud(query: string): Promise<{ ids: number[]; debug: s
   const dbg: string[] = [];
   let ids: number[] = [];
 
+  // 1) Resmi Open Cloud (x-api-key ile)
   if (key) {
     const url = `https://apis.roblox.com/toolbox-service/v2/assets:search?searchCategoryType=Model&query=${k}&limit=${MAX_RESULTS}`;
-    const { ok, status, j, t } = await tryJson(url, { "x-api-key": String(key), "content-type": "application/json" });
+    const { ok, status, j, t } = await tryJson(url, {
+      "x-api-key": String(key),
+      "Content-Type": "application/json",
+    });
     dbg.push(`apis.roblox.com=${status}`);
     if (ok) {
       ids = idsFromAnything(j);
@@ -57,12 +61,12 @@ async function searchOpenCloud(query: string): Promise<{ ids: number[]; debug: s
     dbg.push("no_OPEN_CLOUD_KEY_env");
   }
 
-  // Proxy fallback’ları (kimliksiz)
+  // 2) Proxy fallback’ları (kimliksiz)
   if (!ids.length) {
     const tries = [
       `https://catalog.rprxy.xyz/v2/search/items/details?categoryFilter=CommunityCreations&limit=${MAX_RESULTS}&keyword=${k}`,
       `https://search.rprxy.xyz/catalog/json?Category=Models&Keyword=${k}`,
-      `https://web.rprxy.xyz/catalog?Category=Models&Keyword=${k}`
+      `https://web.rprxy.xyz/catalog?Category=Models&Keyword=${k}`,
     ];
     for (const url of tries) {
       const { ok, status, j, t, host } = await tryJson(url);
@@ -78,11 +82,16 @@ async function searchOpenCloud(query: string): Promise<{ ids: number[]; debug: s
 }
 
 export default async (req: Request) => {
+  // GET: hızlı sağlık/konfig kontrolü
   if (req.method !== "POST") {
-    return new Response(JSON.stringify({ ok: true, msg: "POST { obs:{ prompt:'stone' } }" }), {
-      status: 200, headers: { "Content-Type": "application/json" },
+    const hasKey = Boolean((process.env as any).OPEN_CLOUD_KEY);
+    return new Response(JSON.stringify({ ok: true, env: { OPEN_CLOUD_KEY: hasKey }, version: "v10.1", runtime: "edge" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
     });
   }
+
+  // POST: oyun çağrısı
   try {
     const { obs } = await req.json();
     const prompt = String(obs?.prompt || "").slice(0, 200).trim();
@@ -96,7 +105,8 @@ export default async (req: Request) => {
         actions.push({ type: "PLACE_ASSET", assetId: ids[i], pos: [(col - 1) * GAP, BASE_Y, row * GAP], yaw: 0 });
       }
       return new Response(JSON.stringify({ actions, reason: "toolbox", detail: `found=${ids.join(",")} | ${debug}` }), {
-        status: 200, headers: { "Content-Type": "application/json" },
+        status: 200,
+        headers: { "Content-Type": "application/json" },
       });
     }
 
@@ -105,12 +115,14 @@ export default async (req: Request) => {
       actions: [
         { type: "PLACE_BLOCK", block: "Concrete", pos: [0, 1, 0], size: [16, 1, 16], color: "#D0D0D0" }
       ],
-      reason: "fallback", detail: debug
+      reason: "fallback",
+      detail: debug
     }), { status: 200, headers: { "Content-Type": "application/json" } });
 
   } catch (e: any) {
     return new Response(JSON.stringify({ actions: [], reason: "exception", detail: String(e?.stack || e) }), {
-      status: 200, headers: { "Content-Type": "application/json" },
+      status: 200,
+      headers: { "Content-Type": "application/json" },
     });
   }
 };
