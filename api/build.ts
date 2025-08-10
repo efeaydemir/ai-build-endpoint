@@ -1,5 +1,5 @@
-// api/build.ts — v9.2: toolbox-only, fixed "&&", never 500
-export const config = { runtime: "edge" };
+// api/build.ts — v9.4: toolbox search with roproxy fallbacks, never 500
+export const config = { runtime: "nodejs18.x" };
 
 const MAX_RESULTS = 6;
 const GAP = 10;
@@ -16,49 +16,52 @@ function extractAssetIds(p: string): number[] {
   return Array.from(ids);
 }
 
+async function tryFetchJson(url: string) {
+  const r = await fetch(url, {
+    headers: { Accept: "application/json", "User-Agent": "ai-build-endpoint/1.0" },
+  });
+  const text = await r.text();
+  let json: any = null;
+  try { json = text ? JSON.parse(text) : null; } catch {}
+  return { status: r.status, ok: r.ok, json, text };
+}
+
 async function searchToolbox(keyword: string): Promise<{ ids: number[]; debug: string }> {
+  const k = encodeURIComponent(keyword.trim());
+  const tries = [
+    // modern
+    `https://catalog.roblox.com/v1/search/items/details?Category=Models&Limit=${MAX_RESULTS}&Keyword=${k}`,
+    `https://catalog.roproxy.com/v1/search/items/details?Category=Models&Limit=${MAX_RESULTS}&Keyword=${k}`,
+    `https://catalog.rprxy.xyz/v1/search/items/details?Category=Models&Limit=${MAX_RESULTS}&Keyword=${k}`,
+    // legacy
+    `https://search.roblox.com/catalog/json?Category=Models&Keyword=${k}`,
+    `https://search.roproxy.com/catalog/json?Category=Models&Keyword=${k}`,
+    `https://search.rprxy.xyz/catalog/json?Category=Models&Keyword=${k}`,
+  ];
+
   const dbg: string[] = [];
   const ids: number[] = [];
-  const k = encodeURIComponent(keyword.trim());
 
-  // Modern catalog API
-  try {
-    const r = await fetch(
-      `https://catalog.roblox.com/v1/search/items/details?Category=Models&Limit=${MAX_RESULTS}&Keyword=${k}`,
-      { headers: { Accept: "application/json", "User-Agent": "ai-build-endpoint/1.0" } }
-    );
-    dbg.push(`catalog=${r.status}`);
-    if (r.ok) {
-      const j: any = await r.json();
-      const arr = Array.isArray(j.data) ? j.data : [];
-      for (const it of arr) {
-        if (it && it.id) ids.push(Number(it.id));
-      }
-    }
-  } catch (e: any) {
-    dbg.push(`catalog_err=${String(e)}`);
-  }
-
-  // Legacy fallback
-  if (ids.length === 0) {
+  for (const url of tries) {
     try {
-      const r = await fetch(
-        `https://search.roblox.com/catalog/json?Category=Models&Keyword=${k}`,
-        { headers: { Accept: "application/json", "User-Agent": "ai-build-endpoint/1.0" } }
-      );
-      dbg.push(`legacy=${r.status}`);
-      if (r.ok) {
-        const arr: any[] = await r.json();
-        for (const it of arr || []) {
-          if (it && it.AssetId) ids.push(Number(it.AssetId)); // <-- FIX: '&&' kullanıldı
-        }
+      const { status, ok, json } = await tryFetchJson(url);
+      dbg.push(`${new URL(url).host}=${status}`);
+      if (!ok || !json) continue;
+
+      if (Array.isArray(json.data)) {
+        for (const it of json.data) if (it && it.id) ids.push(Number(it.id));
+      } else if (Array.isArray(json)) {
+        for (const it of json) if (it && (it.AssetId || it.Id || it.id)) ids.push(Number(it.AssetId || it.Id || it.id));
       }
+      if (ids.length) break; // ilk başarılı sonuçta çık
     } catch (e: any) {
-      dbg.push(`legacy_err=${String(e)}`);
+      dbg.push(`${new URL(url).host}_err=${String(e)}`);
     }
   }
 
-  return { ids: ids.slice(0, MAX_RESULTS), debug: dbg.join(" | ") };
+  // benzersiz ve sınırlı
+  const uniq = Array.from(new Set(ids)).slice(0, MAX_RESULTS);
+  return { ids: uniq, debug: dbg.join(" | ") };
 }
 
 export default async (req: Request) => {
@@ -71,27 +74,24 @@ export default async (req: Request) => {
   try {
     const { obs } = await req.json();
     const prompt = String(obs?.prompt || "").slice(0, 200).trim();
+    const actions: any[] = [];
 
-    // 1) Prompt içinde direkt ID/link varsa onları kullan
+    // 1) Prompt içindeki link/ID'leri kullan
     let ids = extractAssetIds(prompt);
     let debug = `ids_in_prompt=${ids.join(",")}`;
 
-    // 2) Yoksa prompt'u anahtar kelime olarak ara
+    // 2) Yoksa prompt'u direkt ara (her zaman dene)
     if (ids.length === 0 && prompt.length >= 2) {
       const r = await searchToolbox(prompt);
       ids = r.ids;
       debug += ` | search: ${r.debug} | found=${ids.join(",")}`;
     }
 
-    const actions: any[] = [];
-
     if (ids.length > 0) {
-      // 3x2 grid yerleşim
+      // 3x2 grid yerleşim (origin'i server offsetleyecek)
       for (let i = 0; i < Math.min(MAX_RESULTS, ids.length); i++) {
-        const col = i % 3,
-          row = Math.floor(i / 3);
-        const x = (col - 1) * GAP;
-        const z = row * GAP;
+        const col = i % 3, row = Math.floor(i / 3);
+        const x = (col - 1) * GAP, z = row * GAP;
         actions.push({ type: "PLACE_ASSET", assetId: ids[i], pos: [x, BASE_Y, z], yaw: 0 });
       }
       return new Response(JSON.stringify({ actions, reason: "toolbox", detail: debug }), {
@@ -100,7 +100,7 @@ export default async (req: Request) => {
       });
     }
 
-    // 3) GARANTİLİ FALLBACK – boş dönme, 200 dön
+    // 3) FALLBACK (boş dönme)
     actions.push({ type: "PLACE_BLOCK", block: "Concrete", pos: [0, 1, 0], size: [16, 1, 16], color: "#D0D0D0" });
     actions.push({ type: "PLACE_MODEL", key: "Bench", pos: [-3, 1, 0], yaw: 0 });
     actions.push({ type: "PLACE_MODEL", key: "Bench", pos: [3, 1, 0], yaw: 180 });
@@ -109,7 +109,6 @@ export default async (req: Request) => {
       headers: { "Content-Type": "application/json" },
     });
   } catch (e: any) {
-    // Asla 500 verme → Roblox PostAsync patlamasın
     return new Response(JSON.stringify({ actions: [], reason: "exception", detail: String(e?.stack || e) }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
