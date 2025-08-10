@@ -1,0 +1,5 @@
+{
+  "name": "ai-build-endpoint",
+  "private": true,
+  "type": "module"
+}
