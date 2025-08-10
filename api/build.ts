@@ -1,80 +1,92 @@
-// api/build.ts — v4: özgür DSL + genişletme + limitler
+// api/build.ts — v5: Template + Planner-Critic (daha anlamlı, stabil)
 export const config = { runtime: "edge" };
 
 const MODEL = "llama-3.1-8b-instant";
 
-// LLM'e sadece bir "program" yazdırıyoruz (sıkı JSON). Çok sayıda OP var.
-const SYSTEM = `
-You output a STRICT JSON "program" for a Roblox world builder.
-Return ONLY:
-{
-  "label":"2-3 words",
-  "palette":["#RRGGBB","#RRGGBB","#RRGGBB"],
-  "program":[
-    {"op":"PLAZA","size":18,"color":"#2D2F5F"},
-    {"op":"ROADGRID","w":22,"h":18,"gap":8,"width":2},
-    {"op":"TOWER","floors":3,"radius":4},
-    {"op":"MODEL","key":"StreetLamp","pos":[8,1,-8],"yaw":0},
-    {"op":"LINE","from":[-10,0],"to":[10,0],"height":1,"width":2,"block":"Slate","color":"#666666"}
-  ]
+// ------------- Temalar & hazır şablonlar -------------
+type ProgramStep = any;
+type Template = { name:string, theme:"city"|"medieval"|"nature"|"space", base: ProgramStep[] };
+
+const TEMPLATES: Template[] = [
+  // Şehir: ızgara + orta meydan
+  { name:"city_grid_1", theme:"city", base: [
+    {op:"PLAZA", size:18, color:"#B0B7C3"},
+    {op:"ROADGRID", w:24, h:20, gap:8, width:2},
+    {op:"LABEL", text:"City Square"}
+  ]},
+  // Medieval: kapı + yol + ev sıraları
+  { name:"med_gate_street", theme:"medieval", base: [
+    {op:"PLAZA", size:18, color:"#C2B280"},
+    {op:"LINE", from:[-14,-10], to:[14,-10], width:2, height:6, block:"Rock", color:"#6B6B6B"},
+    {op:"GATE", width:10, height:9, thickness:2},
+    {op:"HOUSES", rows:2, cols:4, minH:2, maxH:4},
+    {op:"LABEL", text:"Old Gate"}
+  ]},
+  // Doğa: göl/nehir + köprü + ağaç
+  { name:"nature_lake_bridge", theme:"nature", base: [
+    {op:"PLAZA", size:16, color:"#98C379"},
+    {op:"RIVER", length:46, width:10},
+    {op:"BRIDGE", length:12, width:3, arch:2},
+    {op:"TREES", count:24, ringR:16},
+    {op:"LABEL", text:"Green Park"}
+  ]},
+  // Uzay: kubbe + neon ring + grid
+  { name:"space_dome_grid", theme:"space", base: [
+    {op:"PLAZA", size:18, color:"#2D2F5F"},
+    {op:"ROADGRID", w:22, h:18, gap:8, width:2},
+    {op:"DOME", radius:8},
+    {op:"RING", r:10, height:2, step:3, block:"Neon", color:"#7F89FF"},
+    {op:"LABEL", text:"Lunar Dome"}
+  ]},
+];
+
+function inferTheme(prompt: string): "city"|"medieval"|"nature"|"space" {
+  const p = prompt.toLowerCase();
+  if (/(uzay|space|galaksi|neon)/.test(p)) return "space";
+  if (/(kale|castle|orta.*çağ|medieval|duvar|gate|kapı)/.test(p)) return "medieval";
+  if (/(doğa|park|orman|ağaç|river|nehir|göl|lake|bridge|köprü)/.test(p)) return "nature";
+  return "city";
 }
-Allowed ops:
-- PLAZA {size,color}
-- ROADGRID {w,h,gap,width}
-- RIVER {length,width}
-- BRIDGE {length,width,arch}
-- TOWER {floors,radius}
-- PYRAMID {base,levels}
-- DOME {radius}
-- HOUSES {rows,cols,minH,maxH}
-- TREES {count,ringR}
-- LINE {from:[x,z], to:[x,z], width, height, block, color}
-- RING {r, height, step, block, color}
-- DISC {r, thickness, block, color}
-- SPIRAL {r, turns, step, height, block, color}
-- MODEL {key, pos:[x,y,z], yaw}
-- LABEL {text}
 
-Allowed MODEL keys: StreetLamp, Bench  (more can be added later).
-Keep counts small (program <= 30 steps). No prose, no extra keys.
-
-Examples:
-
-USER: "orta çağ şehir kapısı, duvar, birkaç ev"
-PROGRAM: {"label":"Old Gate","palette":["#C2B280","#8A7B66","#6B6B6B"],"program":[
-  {"op":"PLAZA","size":18,"color":"#C2B280"},
-  {"op":"ROADGRID","w":20,"h":16,"gap":8,"width":2},
-  {"op":"LINE","from":[-12,-8],"to":[12,-8],"width":2,"height":6,"block":"Rock","color":"#6B6B6B"},
-  {"op":"GATE","width":10,"height":9,"thickness":2},
-  {"op":"HOUSES","rows":2,"cols":4,"minH":2,"maxH":4},
-  {"op":"LABEL","text":"Old Gate"}
-]}
-
-USER: "doğa parkı, büyük göl ve köprü"
-PROGRAM: {"label":"Green Park","palette":["#98C379","#2C6E49","#6B8E23"],"program":[
-  {"op":"PLAZA","size":16,"color":"#98C379"},
-  {"op":"RIVER","length":46,"width":10},
-  {"op":"BRIDGE","length":12,"width":3,"arch":2},
-  {"op":"TREES","count":20,"ringR":16},
-  {"op":"LABEL","text":"Green Park"}
-]}
-
-USER: "uzay temalı kubbe şehir"
-PROGRAM: {"label":"Lunar Dome","palette":["#2D2F5F","#7F89FF","#6CE1FF"],"program":[
-  {"op":"PLAZA","size":18,"color":"#2D2F5F"},
-  {"op":"ROADGRID","w":22,"h":18,"gap":8,"width":2},
-  {"op":"DOME","radius":8},
-  {"op":"RING","r":10,"height":2,"step":3,"block":"Neon","color":"#7F89FF"},
-  {"op":"LABEL","text":"Lunar Dome"}
-]}
+// ------------- LLM istemleri -------------
+const FILL_SYSTEM = `
+You fill a small JSON program by adding 4-10 steps to a given BASE program.
+Allowed ops: PLAZA, ROADGRID, RIVER, BRIDGE, TOWER, PYRAMID, DOME, HOUSES, TREES, LINE, RING, DISC, SPIRAL, MODEL, GATE, LABEL.
+Return STRICT JSON:
+{"program":[ ...added steps only... ], "label":"2-3 words", "palette":["#RRGGBB","#RRGGBB","#RRGGBB"]}
+Rules:
+- Keep it coherent with the BASE theme.
+- Do not delete or alter BASE; you only add complementary steps.
+- Keep counts small; no spam. Max +12 steps.
+- Prefer structure: streets/paths → buildings → props/greenery → lights.
+No prose.
 `;
 
+const CRITIC_SYSTEM = `
+You are a critic. Score the given program (0-100) with reasons.
+Criteria: coherence with theme, variety (not spam), space balance (not overcrowded), navigable roads, focal point near plaza, max 320 actions.
+Return STRICT JSON: {"score": 0-100, "fix": "short instructions to improve"}
+No prose.
+`;
+
+async function llmJson(messageList: any[]) {
+  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method:"POST",
+    headers:{ "Authorization":`Bearer ${process.env.GROQ_API_KEY!}`, "Content-Type":"application/json" },
+    body: JSON.stringify({ model: MODEL, temperature: 0.2, response_format:{type:"json_object"}, messages: messageList })
+  });
+  if (!r.ok) return null;
+  const j = await r.json();
+  try { return JSON.parse(j.choices?.[0]?.message?.content || "{}"); } catch { return null; }
+}
+
+// ------------- Program genişletici (aynı v4 expand + ufak ekler) -------------
 const clamp = (n:number, lo:number, hi:number)=>Math.max(lo, Math.min(hi, n));
 const palDefault = ["#D0D0D0","#8A8FFF","#6CE1FF"];
 const safeColor = (s?:string)=> /^#?[0-9a-fA-F]{6}$/.test(String(s||"")) ? (s![0]==="#"?s:"#"+s) : "#D0D0D0";
 
 type Act = { type:string; [k:string]:any };
-const MAX_ACTIONS = 400;
+const MAX_ACTIONS = 320;
 
 function expand(program:any[], palette:string[]) {
   const acts:Act[] = [];
@@ -83,7 +95,7 @@ function expand(program:any[], palette:string[]) {
   const addPlaza=(size:number,color?:string)=>{
     const c = safeColor(color||pal[0]);
     acts.push({type:"PLACE_BLOCK", block:"Concrete", pos:[0,1,0], size:[size,1,size], color:c});
-    const k=size/2 - 2;
+    const k=size/2-2;
     for (const [x,z] of [[k,k],[-k,k],[k,-k],[-k,-k]] as const)
       acts.push({type:"PLACE_MODEL", key:"StreetLamp", pos:[x,1,z], yaw:0});
   };
@@ -203,59 +215,86 @@ function expand(program:any[], palette:string[]) {
       case "DISC": addDisc(clamp(step.r??8,2,30), clamp(step.thickness??1,1,6), step.block||"Concrete", step.color); break;
       case "SPIRAL": addSpiral(clamp(step.r??10,4,40), clamp(step.turns??2,1,6), clamp(step.step??6,2,20), clamp(step.height??8,0,40), step.block||"Neon", step.color); break;
       case "MODEL":
-        acts.push({type:"PLACE_MODEL", key:String(step.key||"StreetLamp"), pos:Array.isArray(step.pos)?step.pos:[0,1,0], yaw: Math.floor(Number(step.yaw||0))});
+        // Model anahtarları ServerStorage tarafında ALLOWED_MODELS'te olmalı (StreetLamp, Bench, ...).
+        const pos = Array.isArray(step.pos)&&step.pos.length===3 ? step.pos : [0,1,0];
+        acts.push({type:"PLACE_MODEL", key:String(step.key||"StreetLamp"), pos, yaw: Math.floor(Number(step.yaw||0))});
         break;
       case "LABEL": acts.push({type:"LABEL", text:String(step.text||"AI World"), pos:[0,5,0]}); break;
     }
   }
-
   return acts;
 }
 
+// ------------- Critic -------------
+function scoreHeuristics(program:any[]): number {
+  // çok kaba: çeşit + yol var mı + obje sayısı + denge
+  let s = 50;
+  const types = new Set(program.map(p=>p.op));
+  if (types.has("ROADGRID") || types.has("LINE")) s += 10;
+  if (types.has("HOUSES") || types.has("MODEL")) s += 10;
+  if (types.has("TREES") || types.has("RIVER")) s += 5;
+  const n = program.length;
+  if (n >= 5 && n <= 14) s += 10;
+  return Math.max(0, Math.min(100, s));
+}
+
+async function improveWithCritic(theme:string, base:ProgramStep[], userPrompt:string) {
+  // 1) LLM: base'e ek adımlar üret
+  const seed = await llmJson([
+    {role:"system", content: FILL_SYSTEM},
+    {role:"user", content: `THEME=${theme}\nBASE=${JSON.stringify(base)}\nPROMPT=${userPrompt}`}
+  ]) || { program:[], label:"AI Plaza", palette: [] };
+
+  let program:ProgramStep[] = [...base, ...(Array.isArray(seed.program)?seed.program:[])];
+  let label = typeof seed.label==="string" ? seed.label : "AI World";
+  let palette = Array.isArray(seed.palette)&&seed.palette.length? seed.palette : palDefault;
+
+  // 2) Critic skoru + gerekirse revizyon (en fazla 2 tur)
+  for (let round=0; round<2; round++){
+    const heuristic = scoreHeuristics(program);
+    if (heuristic >= 75) break;
+
+    const critic = await llmJson([
+      {role:"system", content: CRITIC_SYSTEM},
+      {role:"user", content: `PROGRAM=${JSON.stringify(program)}`}
+    ]) || { score:60, fix:"add roads and houses" };
+
+    const hint = critic.fix || "improve balance";
+    const revision = await llmJson([
+      {role:"system", content: FILL_SYSTEM},
+      {role:"user", content: `IMPROVE with hint="${hint}"\nCURRENT=${JSON.stringify(program)}\nReturn only additional or replacement steps (keep it short).`}
+    ]) || { program:[] };
+
+    // küçük bir harman: önceki + yeni ekler (maks 30 adım)
+    const add = Array.isArray(revision.program)? revision.program.slice(0,10):[];
+    program = [...base, ...add].slice(0, 30);
+  }
+
+  return { program, label, palette };
+}
+
+// ------------- Handler -------------
 export default async (req: Request) => {
   if (req.method !== "POST") {
-    return new Response(JSON.stringify({ ok:true, msg:"POST { obs:{ prompt:'...' } } bekleniyor" }), { status:200, headers:{"Content-Type":"application/json"} });
+    return new Response(JSON.stringify({ok:true,msg:"POST { obs:{ prompt:'...' } }"}), { status:200, headers:{"Content-Type":"application/json"}});
   }
   try {
     const { obs } = await req.json();
     const prompt = String(obs?.prompt || "").slice(0, 250);
 
-    // 1) LLM: program üret
-    const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.GROQ_API_KEY!}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: MODEL, temperature: 0.25, response_format:{ type:"json_object" },
-        messages: [
-          { role: "system", content: SYSTEM },
-          { role: "user", content: prompt }
-        ]
-      })
-    });
+    // 1) Tema + şablon seç
+    const theme = inferTheme(prompt);
+    const pool = TEMPLATES.filter(t=>t.theme===theme);
+    const base = pool[Math.floor(Math.random()*pool.length)].base;
 
-    let plan:any = { label:"AI Plaza", palette: palDefault, program:[] };
-    if (r.ok) {
-      const j = await r.json();
-      plan = JSON.parse(j.choices?.[0]?.message?.content || "{}");
-    }
+    // 2) LLM ile base'i doldur + critic ile düzelt
+    const { program, label, palette } = await improveWithCritic(theme, base, prompt);
 
-    // 2) Varsayılanlar
-    const program = Array.isArray(plan.program) && plan.program.length ? plan.program : [
-      {op:"PLAZA", size:16, color:"#D0D0D0"},
-      {op:"ROADGRID", w:20, h:18, gap:8, width:2},
-      {op:"LABEL", text:"AI Plaza"}
-    ];
-    const palette = Array.isArray(plan.palette)&&plan.palette.length ? plan.palette : palDefault;
-    const label = typeof plan.label === "string" ? plan.label.slice(0,24) : "AI World";
-
-    // 3) Genişlet → actions
+    // 3) ACTIONS'a genişlet
     const actions = expand(program, palette);
-    actions.push({ type:"LABEL", text:label, pos:[0,5,0] });
+    actions.push({ type:"LABEL", text: label.slice(0,24), pos:[0,5,0] });
 
-    return new Response(JSON.stringify({ actions, reason:"v4 free-dsl expand" }), { status:200, headers:{"Content-Type":"application/json"}});
+    return new Response(JSON.stringify({ actions, reason:"v5 template+critic" }), { status:200, headers:{"Content-Type":"application/json"}});
   } catch (e:any) {
     return new Response(JSON.stringify({ actions:[{type:"LABEL",text:"AI error",pos:[0,4,0]}], reason:"exception", detail:String(e)}), { status:200, headers:{"Content-Type":"application/json"}});
   }
