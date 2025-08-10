@@ -1,9 +1,17 @@
-// api/build.ts — v10.1: Open Cloud Toolbox (x-api-key), proxy fallback, PLACE_ASSET only + GET env check
+// api/build.ts — v10.2: ID/link parse + Open Cloud (x-api-key) + proxy fallback + GET env check
 export const config = { runtime: "edge" };
 
 const MAX_RESULTS = 6;
 const GAP = 10;
 const BASE_Y = 1;
+
+function extractIdsFromPrompt(p: string): number[] {
+  const s = new Set<number>();
+  const rx = /\b(?:rbxassetid:\/\/|https?:\/\/www\.roblox\.com\/(?:(?:library|catalog))\/)?(\d{6,14})\b/gi;
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(p)) !== null) s.add(Number(m[1]));
+  return Array.from(s);
+}
 
 function idsFromAnything(obj: any): number[] {
   const out: number[] = [];
@@ -43,7 +51,7 @@ async function searchOpenCloud(query: string): Promise<{ ids: number[]; debug: s
   const dbg: string[] = [];
   let ids: number[] = [];
 
-  // 1) Resmi Open Cloud (x-api-key ile)
+  // 1) Resmi Open Cloud
   if (key) {
     const url = `https://apis.roblox.com/toolbox-service/v2/assets:search?searchCategoryType=Model&query=${k}&limit=${MAX_RESULTS}`;
     const { ok, status, j, t } = await tryJson(url, {
@@ -82,20 +90,32 @@ async function searchOpenCloud(query: string): Promise<{ ids: number[]; debug: s
 }
 
 export default async (req: Request) => {
-  // GET: hızlı sağlık/konfig kontrolü
+  // GET: sağlık/konfig kontrolü
   if (req.method !== "POST") {
     const hasKey = Boolean((process.env as any).OPEN_CLOUD_KEY);
-    return new Response(JSON.stringify({ ok: true, env: { OPEN_CLOUD_KEY: hasKey }, version: "v10.1", runtime: "edge" }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
+    return new Response(JSON.stringify({ ok: true, env: { OPEN_CLOUD_KEY: hasKey }, version: "v10.2", runtime: "edge" }), {
+      status: 200, headers: { "Content-Type": "application/json" },
     });
   }
 
-  // POST: oyun çağrısı
   try {
     const { obs } = await req.json();
     const prompt = String(obs?.prompt || "").slice(0, 200).trim();
 
+    // A) Prompt içinde doğrudan ID/link varsa onları kullan
+    const idsInPrompt = extractIdsFromPrompt(prompt);
+    if (idsInPrompt.length) {
+      const actions: any[] = [];
+      for (let i = 0; i < Math.min(MAX_RESULTS, idsInPrompt.length); i++) {
+        const col = i % 3, row = Math.floor(i / 3);
+        actions.push({ type: "PLACE_ASSET", assetId: idsInPrompt[i], pos: [(col - 1) * GAP, BASE_Y, row * GAP], yaw: 0 });
+      }
+      return new Response(JSON.stringify({
+        actions, reason: "toolbox", detail: `from_prompt=${idsInPrompt.join(",")}`
+      }), { status: 200, headers: { "Content-Type": "application/json" }});
+    }
+
+    // B) Aksi halde arama
     const { ids, debug } = await searchOpenCloud(prompt);
 
     if (ids.length) {
@@ -105,24 +125,19 @@ export default async (req: Request) => {
         actions.push({ type: "PLACE_ASSET", assetId: ids[i], pos: [(col - 1) * GAP, BASE_Y, row * GAP], yaw: 0 });
       }
       return new Response(JSON.stringify({ actions, reason: "toolbox", detail: `found=${ids.join(",")} | ${debug}` }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
+        status: 200, headers: { "Content-Type": "application/json" },
       });
     }
 
-    // boş kalmasın
+    // C) Fallback (boş kalmasın)
     return new Response(JSON.stringify({
-      actions: [
-        { type: "PLACE_BLOCK", block: "Concrete", pos: [0, 1, 0], size: [16, 1, 16], color: "#D0D0D0" }
-      ],
-      reason: "fallback",
-      detail: debug
+      actions: [{ type: "PLACE_BLOCK", block: "Concrete", pos: [0, 1, 0], size: [16, 1, 16], color: "#D0D0D0" }],
+      reason: "fallback", detail: debug
     }), { status: 200, headers: { "Content-Type": "application/json" } });
 
   } catch (e: any) {
     return new Response(JSON.stringify({ actions: [], reason: "exception", detail: String(e?.stack || e) }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
+      status: 200, headers: { "Content-Type": "application/json" },
     });
   }
 };
