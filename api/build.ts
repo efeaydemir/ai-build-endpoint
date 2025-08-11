@@ -1,139 +1,121 @@
-// api/build.ts — v10.2: ID/link parse + Open Cloud (x-api-key) + proxy fallback + GET env check
+// api/build.ts — v11.0: ChatGPT (Structured Outputs) → actions[]
 export const config = { runtime: "edge" };
 
-const MAX_RESULTS = 6;
-const GAP = 10;
-const BASE_Y = 1;
+const MODEL = "gpt-4o-mini"; // hızlı & uygun
+const MAX_ACTIONS = 200;
 
-function extractIdsFromPrompt(p: string): number[] {
-  const s = new Set<number>();
-  const rx = /\b(?:rbxassetid:\/\/|https?:\/\/www\.roblox\.com\/(?:(?:library|catalog))\/)?(\d{6,14})\b/gi;
-  let m: RegExpExecArray | null;
-  while ((m = rx.exec(p)) !== null) s.add(Number(m[1]));
-  return Array.from(s);
+type Action =
+  | { type: "PLACE_BLOCK"    ; pos: [number,number,number]; size: [number,number,number]; yaw?: number; color?: string; material?: string; group?: string }
+  | { type: "PLACE_WEDGE"    ; pos: [number,number,number]; size: [number,number,number]; yaw?: number; color?: string; material?: string; group?: string }
+  | { type: "PLACE_CYLINDER" ; pos: [number,number,number]; size: [number,number,number]; yaw?: number; color?: string; material?: string; group?: string };
+
+const schema = {
+  name: "ai_build_actions",
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      actions: {
+        type: "array",
+        maxItems: MAX_ACTIONS,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            type: { type: "string", enum: ["PLACE_BLOCK","PLACE_WEDGE","PLACE_CYLINDER"] },
+            pos:  { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
+            size: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
+            yaw:  { type: "number" },
+            color:{ type: "string" },         // "#RRGGBB" veya "white", "beige"...
+            material: { type: "string" },     // "concrete","wood","glass","smoothplastic","brick"...
+            group:   { type: "string" }       // gruplayıp Model altında toplamak için
+          },
+          required: ["type","pos","size"]
+        }
+      }
+    },
+    required: ["actions"]
+  },
+  strict: true
+};
+
+function sysPrompt() {
+  return [
+    "You are a ROBLOX level designer that outputs ONLY JSON matching the given schema.",
+    "Rules:",
+    "- Units are ROBLOX studs.",
+    "- Place everything RELATIVE to origin [0,0,0]. The game will offset to the player's aim.",
+    "- Keep sizes reasonable (0.1..200). Use integer-ish values when possible.",
+    "- Prefer simple blocks for walls/floors/roof; wedges for sloped roofs; cylinders for pillars.",
+    "- Group related parts with a short group name, e.g., 'house', 'roof', 'windows'.",
+    "- Never include prose; only JSON per schema."
+  ].join("\n");
 }
 
-function idsFromAnything(obj: any): number[] {
-  const out: number[] = [];
-  const push = (v: any) => {
-    const n = Number(v?.itemTargetId ?? v?.assetId ?? v?.AssetId ?? v?.Id ?? v?.id);
-    if (Number.isFinite(n)) out.push(n);
-  };
-  const walk = (x: any) => {
-    if (!x) return;
-    if (Array.isArray(x)) { for (const it of x) walk(it); return; }
-    if (typeof x === "object") { push(x); for (const k in x) walk((x as any)[k]); }
-  };
-  walk(obj);
-  return Array.from(new Set(out));
-}
-
-function idsFromText(text: string): number[] {
-  const s = new Set<number>();
-  const rx1 = /\b(?:itemTargetId|assetId|AssetId|Id|id)"?\s*:\s*(\d{6,14})\b/g;
-  let m: RegExpExecArray | null;
-  while ((m = rx1.exec(text)) !== null) s.add(Number(m[1]));
-  const rx2 = /\/catalog\/(\d{6,14})(?:\/|")/g;
-  while ((m = rx2.exec(text)) !== null) s.add(Number(m[1]));
-  return Array.from(s);
-}
-
-async function tryJson(url: string, headers?: Record<string, string>) {
-  const r = await fetch(url, { headers });
-  const t = await r.text();
-  let j: any = null; try { j = JSON.parse(t); } catch {}
-  return { ok: r.ok, status: r.status, j, t, host: new URL(url).host };
-}
-
-async function searchOpenCloud(query: string): Promise<{ ids: number[]; debug: string }> {
-  const k = encodeURIComponent(query);
-  const key = (process.env as any).OPEN_CLOUD_KEY;
-  const dbg: string[] = [];
-  let ids: number[] = [];
-
-  // 1) Resmi Open Cloud
-  if (key) {
-    const url = `https://apis.roblox.com/toolbox-service/v2/assets:search?searchCategoryType=Model&query=${k}&limit=${MAX_RESULTS}`;
-    const { ok, status, j, t } = await tryJson(url, {
-      "x-api-key": String(key),
-      "Content-Type": "application/json",
-    });
-    dbg.push(`apis.roblox.com=${status}`);
-    if (ok) {
-      ids = idsFromAnything(j);
-      if (!ids.length) ids = idsFromText(t);
-    } else {
-      dbg.push("opencloud_failed");
-    }
-  } else {
-    dbg.push("no_OPEN_CLOUD_KEY_env");
+async function chatJSON(prompt: string) {
+  const apiKey = (process.env as any).OPENAI_API_KEY;
+  if (!apiKey) {
+    return { ok: false, status: 500, body: { actions: [], reason: "NO_KEY" } };
   }
 
-  // 2) Proxy fallback’ları (kimliksiz)
-  if (!ids.length) {
-    const tries = [
-      `https://catalog.rprxy.xyz/v2/search/items/details?categoryFilter=CommunityCreations&limit=${MAX_RESULTS}&keyword=${k}`,
-      `https://search.rprxy.xyz/catalog/json?Category=Models&Keyword=${k}`,
-      `https://web.rprxy.xyz/catalog?Category=Models&Keyword=${k}`,
-    ];
-    for (const url of tries) {
-      const { ok, status, j, t, host } = await tryJson(url);
-      dbg.push(`${host}=${status}`);
-      if (!ok) continue;
-      ids = idsFromAnything(j);
-      if (!ids.length) ids = idsFromText(t);
-      if (ids.length) break;
+  const body = {
+    model: MODEL,
+    messages: [
+      { role: "system", content: sysPrompt() },
+      { role: "user",   content: prompt }
+    ],
+    temperature: 0.2,
+    // OpenAI Structured Outputs (JSON Schema)
+    response_format: {
+      type: "json_schema",
+      json_schema: schema
     }
+  };
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  const txt = await r.text();
+  let j: any = null; try { j = JSON.parse(txt); } catch {}
+
+  if (!r.ok) {
+    return { ok: false, status: r.status, body: { actions: [], reason: "OPENAI_FAIL", detail: txt } };
   }
 
-  return { ids: Array.from(new Set(ids)).slice(0, MAX_RESULTS), debug: dbg.join(" | ") };
+  const content = j?.choices?.[0]?.message?.content ?? "";
+  let data: any = null; try { data = JSON.parse(content); } catch {}
+  if (!data || !Array.isArray(data.actions)) {
+    return { ok: false, status: 200, body: { actions: [], reason: "BAD_MODEL_JSON", detail: content } };
+  }
+
+  // Güvenlik: makul sayı ve değerler
+  data.actions = data.actions.slice(0, MAX_ACTIONS);
+  return { ok: true, status: 200, body: data };
 }
 
 export default async (req: Request) => {
-  // GET: sağlık/konfig kontrolü
   if (req.method !== "POST") {
-    const hasKey = Boolean((process.env as any).OPEN_CLOUD_KEY);
-    return new Response(JSON.stringify({ ok: true, env: { OPEN_CLOUD_KEY: hasKey }, version: "v10.2", runtime: "edge" }), {
+    const hasKey = Boolean((process.env as any).OPENAI_API_KEY);
+    return new Response(JSON.stringify({ ok: true, env: { OPENAI_API_KEY: hasKey }, version: "v11.0", runtime: "edge" }), {
       status: 200, headers: { "Content-Type": "application/json" },
     });
   }
 
   try {
     const { obs } = await req.json();
-    const prompt = String(obs?.prompt || "").slice(0, 200).trim();
-
-    // A) Prompt içinde doğrudan ID/link varsa onları kullan
-    const idsInPrompt = extractIdsFromPrompt(prompt);
-    if (idsInPrompt.length) {
-      const actions: any[] = [];
-      for (let i = 0; i < Math.min(MAX_RESULTS, idsInPrompt.length); i++) {
-        const col = i % 3, row = Math.floor(i / 3);
-        actions.push({ type: "PLACE_ASSET", assetId: idsInPrompt[i], pos: [(col - 1) * GAP, BASE_Y, row * GAP], yaw: 0 });
-      }
-      return new Response(JSON.stringify({
-        actions, reason: "toolbox", detail: `from_prompt=${idsInPrompt.join(",")}`
-      }), { status: 200, headers: { "Content-Type": "application/json" }});
+    const prompt = String(obs?.prompt || "").slice(0, 300).trim();
+    if (!prompt) {
+      return new Response(JSON.stringify({ actions: [], reason: "EMPTY" }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
-    // B) Aksi halde arama
-    const { ids, debug } = await searchOpenCloud(prompt);
-
-    if (ids.length) {
-      const actions: any[] = [];
-      for (let i = 0; i < Math.min(MAX_RESULTS, ids.length); i++) {
-        const col = i % 3, row = Math.floor(i / 3);
-        actions.push({ type: "PLACE_ASSET", assetId: ids[i], pos: [(col - 1) * GAP, BASE_Y, row * GAP], yaw: 0 });
-      }
-      return new Response(JSON.stringify({ actions, reason: "toolbox", detail: `found=${ids.join(",")} | ${debug}` }), {
-        status: 200, headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    // C) Fallback (boş kalmasın)
-    return new Response(JSON.stringify({
-      actions: [{ type: "PLACE_BLOCK", block: "Concrete", pos: [0, 1, 0], size: [16, 1, 16], color: "#D0D0D0" }],
-      reason: "fallback", detail: debug
-    }), { status: 200, headers: { "Content-Type": "application/json" } });
+    const { ok, status, body } = await chatJSON(prompt);
+    return new Response(JSON.stringify(body), { status: ok ? 200 : status, headers: { "Content-Type": "application/json" } });
 
   } catch (e: any) {
     return new Response(JSON.stringify({ actions: [], reason: "exception", detail: String(e?.stack || e) }), {
