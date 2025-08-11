@@ -1,15 +1,16 @@
-// api/build.ts — vG-MEGA-2.3 (units-aware, TR+EN, wider examples)
+// api/build.ts — vG-MEGA-2.4  (diversity seed + stairs example + higher temp)
 export const config = { runtime: "edge" };
 
 const MODEL = (process.env as any).GEMINI_MODEL || "gemini-1.5-pro-latest";
-const TEMP  = 0.15;
+const TEMP  = 0.35;           // ↑ a little more variety
 const TOK   = 900;
 
 const SYS = [
   "You output ONLY JSON. No extra text.",
-  "User text may be in ANY language. Choose EXACTLY ONE intent.",
-  "Understand units/dimensions like '20x15 ft', '10m', '6 m x 4 m'. Convert to studs: 1 stud = 1 foot.",
-  "If dimensions exist, map them to plan.footprint width/depth or primitive size, keeping numbers reasonable.",
+  "User text may be in ANY language.",
+  "Understand units/dimensions like '20x15 ft', '10m', '6 m x 4 m'. Convert to studs (1 stud = 1 foot).",
+  "If dimensions exist, map them to footprint/size.",
+  "If [DIVERSITY_SEED:N] is present, allow small randomized style differences each call.",
   "Supported intents:",
   "- primitive: {shape:'block|cylinder|sphere|wedge', size:[x,y,z], yaw?, material?, color?}",
   "- terrain:   {material:'grass|sand|water|rock|mud|snow|ground', size:[x,y,z]}",
@@ -17,24 +18,22 @@ const SYS = [
   "- furniture: {furniture:{type:'chair|table|bed|sofa|desk|bookshelf', count}}",
   "- lights:    {lights:{type:'lamp_post', count}}",
   "- waterfall: {waterfall:{width,height,poolDepth}}",
-  "- setpiece:  {set:{type:'park|road|intersection|fence|tree_cluster|bridge|castle_gate|playground|garden|fountain|tower|arch|stairs|roundabout|parking', scale:'small|medium|large', extra?}}",
-  "Keep sizes realistic (studs). Return exactly one JSON object."
+  "- setpiece:  {set:{type:'park|road|intersection|fence|tree_cluster|bridge|castle_gate|playground|garden|fountain|tower|arch|stairs|roundabout|parking|tree_single', scale:'small|medium|large', extra?}}",
+  "Return exactly one JSON object."
 ].join("\n");
 
-// tiny pre-normalizer for dimensions/units (helps the model)
 function normalizeUnits(src: string): string {
-  const t = String(src || "");
-  // unify × variants
-  return t.replace(/[xX*×]/g, "x");
+  return String(src || "").replace(/[xX*×]/g, "x");
 }
 
 const EXS: Array<[string, any]> = [
   ["stick", {intent:"primitive", shape:"cylinder", size:[1,6,1], material:"wood", color:"#C08A55"}],
   ["grass", {intent:"terrain", material:"grass", size:[24,2,24]}],
-  ["add big water", {intent:"terrain", material:"water", size:[60,6,60]}],
   ["waterfall", {intent:"waterfall", waterfall:{width:24, height:20, poolDepth:4}}],
-
-  // units / dimensions
+  ["stairs 14 steps", {intent:"setpiece", set:{type:"stairs", scale:"medium", extra:{steps:14, width:6, height:7, run:1.5}}}],
+  ["roundabout", {intent:"setpiece", set:{type:"roundabout", scale:"medium", extra:{radius:12}}}],
+  ["parking", {intent:"setpiece", set:{type:"parking", scale:"medium", extra:{width:30, depth:20}}}],
+  ["trees", {intent:"setpiece", set:{type:"tree_cluster", scale:"medium", extra:{count:12, radius:18}}}],
   ["house 30x20 ft gable", {intent:"structure", plan:{
     kind:"house", floors:1, footprint:{width:30, depth:20},
     wall:{height:8, thickness:0.6, material:"smoothplastic", color:"#EDEDED"},
@@ -49,22 +48,9 @@ const EXS: Array<[string, any]> = [
     windows:[{wall:"front", bottom:3, height:2.5, width:2.2, count:3, spacing:3, offset:0}],
     roof:{type:"flat", height:1, overhang:1, material:"concrete", color:"#D0D0D0"}
   }}],
-
-  ["roundabout", {intent:"setpiece", set:{type:"roundabout", scale:"medium", extra:{radius:12}}}],
-  ["parking", {intent:"setpiece", set:{type:"parking", scale:"medium", extra:{width:30, depth:20}}}],
-  ["trees", {intent:"setpiece", set:{type:"tree_cluster", scale:"medium", extra:{count:12, radius:18}}}],
-  ["fountain", {intent:"setpiece", set:{type:"fountain", scale:"small"}}],
-  ["çit", {intent:"setpiece", set:{type:"fence", scale:"medium", extra:{length:24, height:4}}}],
-  ["beyaz düz çatılı küçük ev", {intent:"structure", plan:{
-    kind:"house", floors:1, footprint:{width:16, depth:12},
-    wall:{height:7, thickness:0.6, material:"smoothplastic", color:"#EDEDED"},
-    door:{wall:"front", width:3, height:6, offset:0},
-    windows:[{wall:"front", bottom:3, height:2, width:2, count:2, spacing:3, offset:0}],
-    roof:{type:"flat", height:1, overhang:1, material:"concrete", color:"#D0D0D0"}
-  }}],
 ];
 
-async function genIntent(prompt: string) {
+async function genIntent(prompt: string, rndSeed: number) {
   const key = (process.env as any).GEMINI_API_KEY;
   if (!key) return { ok:false, status:500, body:{ reason:"NO_KEY" } };
 
@@ -76,11 +62,11 @@ async function genIntent(prompt: string) {
       { role:"user",  parts:[{text:String(u)}] },
       { role:"model", parts:[{text: JSON.stringify(j)}] }
     ])),
-    { role:"user",  parts:[{text: normalizeUnits(prompt)}] }
+    { role:"user",  parts:[{text: normalizeUnits(`[DIVERSITY_SEED:${rndSeed}] ` + prompt)}] }
   ];
 
   const body = { contents, generationConfig: { temperature: TEMP, maxOutputTokens: TOK, responseMimeType: "application/json" } };
-  const r   = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
+  const r   = await fetch(url, { method:"POST", headers:{ "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const txt = await r.text();
   if (!r.ok) return { ok:false, status:r.status, body:{ reason:"GEMINI_FAIL", detail: txt.slice(0,500) } };
 
@@ -117,15 +103,16 @@ async function genIntent(prompt: string) {
 export default async (req: Request) => {
   if (req.method !== "POST") {
     const hasKey = Boolean((process.env as any).GEMINI_API_KEY);
-    return new Response(JSON.stringify({ ok:true, env:{ GEMINI_API_KEY: hasKey, MODEL }, version:"vG-MEGA-2.3", runtime:"edge" }), {
+    return new Response(JSON.stringify({ ok:true, env:{ GEMINI_API_KEY: hasKey, MODEL }, version:"vG-MEGA-2.4", runtime:"edge" }), {
       status:200, headers:{ "Content-Type":"application/json" }
     });
   }
   try {
     const { obs } = await req.json();
-    const prompt = String(obs?.prompt || "").slice(0,500).trim();
+    const prompt  = String(obs?.prompt || "").slice(0,500).trim();
+    const rnd     = Number(obs?.rnd || Math.floor(Math.random()*1e9));
     if (!prompt) return new Response(JSON.stringify({ reason:"EMPTY" }), { status:200, headers:{ "Content-Type":"application/json" } });
-    const { ok, status, body } = await genIntent(prompt);
+    const { ok, status, body } = await genIntent(prompt, rnd);
     return new Response(JSON.stringify(body), { status: ok ? 200 : status, headers:{ "Content-Type":"application/json" } });
   } catch (e:any) {
     return new Response(JSON.stringify({ reason:"exception", detail:String(e?.stack || e) }), { status:200, headers:{ "Content-Type":"application/json" } });
