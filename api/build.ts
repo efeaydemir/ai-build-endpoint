@@ -1,4 +1,4 @@
-// api/build.ts — vG-1.1 (Gemini 1.5 Flash, structured JSON actions)
+// api/build.ts — vG-1.2 (Gemini 1.5 Flash, structured JSON — no additionalProperties)
 export const config = { runtime: "edge" };
 
 const MODEL = "gemini-1.5-flash-latest";
@@ -8,7 +8,6 @@ const TEMP = 0.2;
 
 const schema = {
   type: "object",
-  additionalProperties: false,
   required: ["actions"],
   properties: {
     actions: {
@@ -17,15 +16,14 @@ const schema = {
       maxItems: MAX_ACTIONS,
       items: {
         type: "object",
-        additionalProperties: false,
         required: ["type","pos","size"],
         properties: {
           type:     { type: "string", enum: ["PLACE_BLOCK","PLACE_WEDGE","PLACE_CYLINDER"] },
           pos:      { type: "array", minItems: 3, maxItems: 3, items: { type: "number" } },
           size:     { type: "array", minItems: 3, maxItems: 3, items: { type: "number" } },
           yaw:      { type: "number" },
-          color:    { type: "string" },     // "#RRGGBB" veya "white"...
-          material: { type: "string" },     // "concrete","glass","smoothplastic"...
+          color:    { type: "string" },
+          material: { type: "string" },
           group:    { type: "string" }
         }
       }
@@ -50,9 +48,9 @@ async function callGeminiJSON(prompt: string) {
     systemInstruction: { role: "system", parts: [{ text: SYS }] },
     generationConfig: {
       temperature: TEMP,
-      max_output_tokens: MAX_OUT_TOKENS,            // <-- snake_case
-      response_mime_type: "application/json",       // <-- snake_case
-      response_schema: schema                       // <-- JSON schema (lowercase types)
+      max_output_tokens: MAX_OUT_TOKENS,
+      response_mime_type: "application/json",
+      response_schema: schema
     }
   };
 
@@ -75,7 +73,6 @@ async function callGeminiJSON(prompt: string) {
       return { ok:false, status:r.status, body:{ actions:[], reason:"GEMINI_FAIL", detail: txt.slice(0,400) } };
     }
 
-    // Gemini JSON mode → text olarak JSON döner
     let j:any=null; try { j = JSON.parse(txt); } catch {}
     const part = j?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!part) return { ok:false, status:200, body:{ actions:[], reason:"NO_TEXT", detail: txt.slice(0,400) } };
@@ -93,8 +90,9 @@ async function callGeminiJSON(prompt: string) {
 export default async (req: Request) => {
   if (req.method !== "POST") {
     const hasKey = Boolean((process.env as any).GEMINI_API_KEY);
-    return new Response(JSON.stringify({ ok:true, env:{ GEMINI_API_KEY: hasKey }, version:"vG-1.1", runtime:"edge" }),
-      { status:200, headers:{ "Content-Type":"application/json" } });
+    return new Response(JSON.stringify({ ok:true, env:{ GEMINI_API_KEY: hasKey }, version:"vG-1.2", runtime:"edge" }), {
+      status:200, headers:{ "Content-Type":"application/json" }
+    });
   }
 
   try {
