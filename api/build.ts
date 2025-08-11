@@ -1,4 +1,4 @@
-// api/build.ts — vG-MEGA-2.0 (Gemini 1.5 Pro, geniş intent + çok dilli)
+// api/build.ts — vG-MEGA-2.2 (Gemini 1.5 Pro, çok dilli & geniş intent seti)
 export const config = { runtime: "edge" };
 
 const MODEL = (process.env as any).GEMINI_MODEL || "gemini-1.5-pro-latest";
@@ -10,16 +10,16 @@ const SYS = [
   "User text may be in ANY language (e.g., Turkish). Normalize meaning and choose ONE intent.",
   "Supported intents and minimal fields:",
   "- primitive: {shape:'block|cylinder|sphere|wedge', size:[x,y,z], yaw?, material?, color?}",
-  "- terrain: {material:'grass|sand|water|rock|mud|snow|ground', size:[x,y,z]}",
+  "- terrain:   {material:'grass|sand|water|rock|mud|snow|ground', size:[x,y,z]}",
   "- structure: {plan:{kind:'house', floors, footprint:{width,depth}, wall:{height,thickness,material,color}, door:{wall,width,height,offset}, windows:[...], roof:{type,height,overhang,material,color}}}",
-  "- furniture: {furniture:{type:'chair|table|bed|sofa|desk', count}}",
-  "- lights: {lights:{type:'lamp_post', count}}",
+  "- furniture: {furniture:{type:'chair|table|bed|sofa|desk|bookshelf', count}}",
+  "- lights:    {lights:{type:'lamp_post', count}}",
   "- waterfall: {waterfall:{width,height,poolDepth}}",
-  "- setpiece: {set:{type:'galactic_base|classroom|pool|park|road|fence|tree_cluster|bridge|castle_gate|playground', scale:'small|medium|large', extra?}}",
+  "- setpiece:  {set:{type:'galactic_base|classroom|pool|park|road|intersection|fence|tree_cluster|bridge|castle_gate|playground|garden|fountain|tower|arch|stairs', scale:'small|medium|large', extra?}}",
   "Keep sizes reasonable (studs). Prefer simple numbers. Return exactly one JSON object."
 ].join("\n");
 
-// few-shots (EN + TR)
+// Few-shot örnekleri (EN + TR)
 const EXS: Array<[string, any]> = [
   ["stick", {intent:"primitive", shape:"cylinder", size:[1,6,1], material:"wood", color:"#C08A55"}],
   ["grass", {intent:"terrain", material:"grass", size:[24,2,24]}],
@@ -28,7 +28,13 @@ const EXS: Array<[string, any]> = [
   ["galactic base", {intent:"setpiece", set:{type:"galactic_base", scale:"large"}}],
   ["classroom 4 rows", {intent:"setpiece", set:{type:"classroom", scale:"medium", extra:{rows:4, cols:4}}}],
   ["pool 12x8 depth 4", {intent:"setpiece", set:{type:"pool", scale:"medium", extra:{width:12, length:8, depth:4}}}],
-  ["park with trees", {intent:"setpiece", set:{type:"park", scale:"medium", extra:{trees:8}}}],
+  ["park with trees", {intent:"setpiece", set:{type:"park", scale:"medium", extra:{trees:10}}}],
+  ["road with intersection", {intent:"setpiece", set:{type:"intersection", scale:"medium", extra:{arms:4, width:10}}}],
+  ["small arch", {intent:"setpiece", set:{type:"arch", scale:"small"}}],
+  ["modern tower", {intent:"setpiece", set:{type:"tower", scale:"large", extra:{floors:6}}}],
+  ["playground", {intent:"setpiece", set:{type:"playground", scale:"medium"}}],
+  ["garden with flowers", {intent:"setpiece", set:{type:"garden", scale:"small", extra:{beds:4}}}],
+  ["fountain", {intent:"setpiece", set:{type:"fountain", scale:"small"}}],
   ["build a small house with flat roof", {intent:"structure", plan:{
     kind:"house", floors:1, footprint:{width:18, depth:14},
     wall:{height:8, thickness:0.6, material:"smoothplastic", color:"#EDEDED"},
@@ -67,8 +73,8 @@ async function genIntent(prompt: string) {
     contents,
     generationConfig: {
       temperature: TEMP,
-      max_output_tokens: TOK,
-      response_mime_type: "application/json"
+      maxOutputTokens: TOK,
+      responseMimeType: "application/json"
     }
   };
 
@@ -83,11 +89,9 @@ async function genIntent(prompt: string) {
   let data:any=null; try { data = JSON.parse(jsonText) } catch {}
   if (!data || !data.intent) return { ok:false, status:200, body:{ reason:"BAD_JSON", detail: jsonText.slice(0,500) } };
 
-  // clamps (sunucu tarafı da ayrıca kontrol ediyor)
+  // clamps
   const clamp = (n:number,a:number,b:number)=>Math.max(a,Math.min(b,Number(n||0)));
-  if (Array.isArray(data.size)) {
-    data.size = [ clamp(data.size[0],1,250), clamp(data.size[1],1,80), clamp(data.size[2],1,250) ];
-  }
+  if (Array.isArray(data.size)) data.size = [ clamp(data.size[0],1,250), clamp(data.size[1],1,80), clamp(data.size[2],1,250) ];
   if (data.waterfall) {
     data.waterfall.width     = clamp(data.waterfall.width,  6, 140);
     data.waterfall.height    = clamp(data.waterfall.height, 8,  90);
@@ -104,13 +108,14 @@ async function genIntent(prompt: string) {
     p.door = p.door || { wall:"front", width:3, height:6, offset:0 };
     p.windows = Array.isArray(p.windows) ? p.windows : [];
   }
+
   return { ok:true, status:200, body:data };
 }
 
 export default async (req: Request) => {
   if (req.method !== "POST") {
     const hasKey = Boolean((process.env as any).GEMINI_API_KEY);
-    return new Response(JSON.stringify({ ok:true, env:{ GEMINI_API_KEY: hasKey, MODEL }, version:"vG-MEGA-2.0", runtime:"edge" }), {
+    return new Response(JSON.stringify({ ok:true, env:{ GEMINI_API_KEY: hasKey, MODEL }, version:"vG-MEGA-2.2", runtime:"edge" }), {
       status:200, headers:{ "Content-Type":"application/json" }
     });
   }
