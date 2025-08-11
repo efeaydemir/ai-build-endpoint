@@ -1,89 +1,58 @@
-// api/build.ts — vINT-1.0 (Prompt → intent JSON)
-// Returns { intent: "primitive"|"terrain"|"structure", ... }
-// env: GEMINI_API_KEY
-
+// api/build.ts — vINT-1.5 (intent router: primitive | terrain | structure | waterfall | setpiece)
 export const config = { runtime: "edge" };
 
-const MODEL = "gemini-1.5-flash-latest"; // istersen: "gemini-1.5-pro-latest"
+const MODEL = "gemini-1.5-pro-latest"; // istersen flash-latest de olur; pro daha “akıllı”
 const TEMP = 0.1;
-const TOK = 600;
+const TOK  = 700;
 
 const SYS = [
-  "You output ONLY JSON. No text. Decide the best intent for a Roblox builder:",
-  "- primitive: for single shapes (stick, pole, pillar, plank, cube, sphere, ramp/wedge, wall, floor).",
-  "- terrain: for surface patches (grass, sand, water, rock, mud, snow, ground).",
-  "- structure: for small buildings (house, shed, pavilion).",
-  "Always include minimal numeric params so the server can build safely.",
-  "Units: studs. Keep sizes reasonable."
+  "You output ONLY JSON. No text. Choose an intent for a Roblox builder:",
+  "- primitive: single shapes (stick, pole, pillar, plank, cube, sphere, wedge, wall, floor).",
+  "- terrain: surface patches using Roblox Terrain (grass, sand, water, rock, mud, snow, ground, big water, lake, ocean).",
+  "- structure: small buildings (house/shed/pavilion) -> return {plan:{...}} (footprint/wall/door/windows/roof).",
+  "- waterfall: a waterfall against a rock wall -> return {waterfall:{width,height,poolDepth}}.",
+  "- setpiece: themed compositions (e.g., galactic base / sci-fi base) -> return {set:{type:'galactic_base',scale:'small|medium|large'}}.",
+  "Always include minimal numeric params. Stud units. Keep sizes reasonable."
 ].join("\n");
 
-// few-shot: stick → primitive, grass → terrain, small house → structure
+// few-shots
 const EXS = [
-  {
-    role: "user", parts: [{ text: "stick" }]
-  },
-  {
-    role: "model", parts: [{
-      text: JSON.stringify({
-        intent: "primitive",
-        shape: "cylinder",
-        size: [1, 6, 1],
-        yaw: 0,
-        material: "wood",
-        color: "#C08A55",
-        group: "stick"
-      })
-    }]
-  },
-  {
-    role: "user", parts: [{ text: "grass" }]
-  },
-  {
-    role: "model", parts: [{
-      text: JSON.stringify({
-        intent: "terrain",
-        material: "grass",
-        size: [24, 2, 24],
-        group: "grass_patch"
-      })
-    }]
-  },
-  {
-    role: "user", parts: [{ text: "small white house with flat roof and many windows" }]
-  },
-  {
-    role: "model", parts: [{
-      text: JSON.stringify({
-        intent: "structure",
-        plan: {
-          kind: "house",
-          floors: 1,
-          footprint: { width: 18, depth: 14 },
-          wall: { height: 8, thickness: 0.6, material: "smoothplastic", color: "#EDEDED" },
-          door: { wall: "front", width: 3, height: 6.5, offset: 0 },
-          windows: [
-            { wall: "front", bottom: 3, height: 2.5, width: 2.2, count: 2, spacing: 3, offset: -4 },
-            { wall: "front", bottom: 3, height: 2.5, width: 2.2, count: 2, spacing: 3, offset:  4 }
-          ],
-          roof: { type: "flat", height: 1, overhang: 1, material: "concrete", color: "#D0D0D0" },
-          palette: { glass: "#88BFFF" }
-        }
-      })
-    }]
-  }
+  { role:"user",  parts:[{ text:"stick" }] },
+  { role:"model", parts:[{ text: JSON.stringify({ intent:"primitive", shape:"cylinder", size:[1,6,1], yaw:0, material:"wood", color:"#C08A55" }) }] },
+
+  { role:"user",  parts:[{ text:"add big water" }] },
+  { role:"model", parts:[{ text: JSON.stringify({ intent:"terrain", material:"water", size:[60,6,60], group:"big_water" }) }] },
+
+  { role:"user",  parts:[{ text:"waterfall" }] },
+  { role:"model", parts:[{ text: JSON.stringify({ intent:"waterfall", waterfall:{ width:24, height:20, poolDepth:4 } }) }] },
+
+  { role:"user",  parts:[{ text:"galactic base" }] },
+  { role:"model", parts:[{ text: JSON.stringify({ intent:"setpiece", set:{ type:"galactic_base", scale:"large" } }) }] },
+
+  { role:"user",  parts:[{ text:"small white house with flat roof and many windows" }] },
+  { role:"model", parts:[{ text: JSON.stringify({
+      intent:"structure",
+      plan:{
+        kind:"house",
+        floors:1,
+        footprint:{ width:18, depth:14 },
+        wall:{ height:8, thickness:0.6, material:"smoothplastic", color:"#EDEDED" },
+        door:{ wall:"front", width:3, height:6.5, offset:0 },
+        windows:[{ wall:"front", bottom:3, height:2.5, width:2.2, count:4, spacing:3, offset:0 }],
+        roof:{ type:"flat", height:1, overhang:1, material:"concrete", color:"#D0D0D0" },
+        palette:{ glass:"#88BFFF" }
+      }
+  }) }] }
 ];
 
 async function genIntent(prompt: string) {
   const key = (process.env as any).GEMINI_API_KEY;
   if (!key) return { ok:false, status:500, body:{ reason:"NO_KEY" } };
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${encodeURIComponent(key)}`;
+  const url  = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${encodeURIComponent(key)}`;
   const body = {
-    systemInstruction: { role: "system", parts: [{ text: SYS }] },
-    contents: [
-      ...EXS,
-      { role: "user", parts: [{ text: prompt }] }
-    ],
+    systemInstruction: { role:"system", parts:[{ text: SYS }] },
+    contents: [ ...EXS, { role:"user", parts:[{ text: prompt }] } ],
     generationConfig: {
       temperature: TEMP,
       max_output_tokens: TOK,
@@ -91,7 +60,7 @@ async function genIntent(prompt: string) {
     }
   };
 
-  const r = await fetch(url, { method: "POST", headers: { "Content-Type":"application/json" }, body: JSON.stringify(body) });
+  const r   = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
   const txt = await r.text();
   if (!r.ok) return { ok:false, status:r.status, body:{ reason:"GEMINI_FAIL", detail: txt.slice(0,400) } };
 
@@ -102,13 +71,18 @@ async function genIntent(prompt: string) {
   let data:any=null; try { data = JSON.parse(jsonText) } catch {}
   if (!data || !data.intent) return { ok:false, status:200, body:{ reason:"BAD_JSON", detail: jsonText.slice(0,400) } };
 
-  // basic clamps
+  // gentle clamps
   if (Array.isArray(data.size)) {
     data.size = [
-      Math.max(0.1, Math.min(120, Number(data.size[0] || 4))),
-      Math.max(0.1, Math.min(60,  Number(data.size[1] || 4))),
-      Math.max(0.1, Math.min(120, Number(data.size[2] || 4)))
+      Math.max(1, Math.min(200, Number(data.size[0] || 20))),
+      Math.max(1, Math.min(60,  Number(data.size[1] || 2))),
+      Math.max(1, Math.min(200, Number(data.size[2] || 20)))
     ];
+  }
+  if (data.waterfall) {
+    data.waterfall.width     = Math.max(6,  Math.min(120, Number(data.waterfall.width || 24)));
+    data.waterfall.height    = Math.max(8,  Math.min(80,  Number(data.waterfall.height || 20)));
+    data.waterfall.poolDepth = Math.max(2,  Math.min(12, Number(data.waterfall.poolDepth || 4)));
   }
   if (data.plan) {
     const p = data.plan;
@@ -129,8 +103,9 @@ async function genIntent(prompt: string) {
 export default async (req: Request) => {
   if (req.method !== "POST") {
     const hasKey = Boolean((process.env as any).GEMINI_API_KEY);
-    return new Response(JSON.stringify({ ok:true, env:{ GEMINI_API_KEY: hasKey }, version:"vINT-1.0", runtime:"edge" }),
-      { status:200, headers:{ "Content-Type":"application/json" } });
+    return new Response(JSON.stringify({ ok:true, env:{ GEMINI_API_KEY: hasKey }, version:"vINT-1.5", runtime:"edge" }), {
+      status:200, headers:{ "Content-Type":"application/json" }
+    });
   }
   try {
     const { obs } = await req.json();
